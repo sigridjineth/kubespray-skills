@@ -7,10 +7,12 @@ A comprehensive skill set for deploying and managing production-ready Kubernetes
 Kubespray is an Ansible-based tool that automates Kubernetes cluster deployment. It handles everything that `kubeadm` doesn't: OS preparation, container runtime installation, CNI networking, etcd clustering, and high availability setup.
 
 These skills encode operational knowledge for:
+- Lab environment setup (Vagrant/VirtualBox)
 - First-time cluster deployments
 - Troubleshooting common failures
 - High availability configuration
-- Cluster lifecycle operations (upgrades, scaling)
+- Cluster lifecycle operations (upgrades, scaling, node management)
+- Production monitoring (Prometheus, Grafana, etcd metrics)
 - Air-gapped/offline deployments
 - Certificate management
 
@@ -22,10 +24,12 @@ Skills are automatically loaded by Claude Code when your task matches the skill'
 
 | Your Request | Skill Invoked |
 |--------------|---------------|
+| "Set up a Vagrant lab for Kubespray" | `kubespray-lab-setup` |
 | "Deploy a Kubernetes cluster with Kubespray" | `kubespray-deployment` |
 | "My deployment failed with connection refused" | `kubespray-troubleshooting` |
 | "Set up HA with multiple control planes" | `kubespray-ha-configuration` |
-| "Upgrade from Kubernetes 1.29 to 1.30" | `kubespray-operations` |
+| "Upgrade from Kubernetes 1.32 to 1.34" | `kubespray-operations` |
+| "Set up Prometheus and Grafana monitoring" | `kubespray-monitoring` |
 | "Deploy to air-gapped environment" | `kubespray-airgap` |
 | "Certificates are expiring" | `kubespray-certificates` |
 
@@ -33,15 +37,31 @@ Skills are automatically loaded by Claude Code when your task matches the skill'
 
 Invoke a skill directly by name:
 ```
+/kubespray-lab-setup
 /kubespray-deployment
 /kubespray-troubleshooting
 /kubespray-ha-configuration
 /kubespray-operations
+/kubespray-monitoring
 /kubespray-airgap
 /kubespray-certificates
 ```
 
 ## Available Skills
+
+### kubespray-lab-setup
+
+**Use when:** Setting up a local Vagrant/VirtualBox lab environment for Kubespray, provisioning multi-node clusters with Rocky Linux 10.
+
+**Covers:**
+- Architecture overview (admin-lb + 3 CP + 2 workers)
+- Complete Vagrantfile with networking configuration
+- Admin-LB bootstrap script (HAProxy, NFS, tools, SSH keys)
+- Node init script (swap, kernel modules, sysctl)
+- Rocky Linux 10 considerations (Python 3.12 PEP 668)
+- Environment deployment and verification
+
+---
 
 ### kubespray-deployment
 
@@ -81,12 +101,13 @@ Invoke a skill directly by name:
 - HA architecture (active-active API servers, leader election)
 - etcd quorum sizing (why odd numbers matter)
 - Stacked vs external etcd
-- Load balancing options:
-  - Client-side (nginx/haproxy on workers)
-  - kube-vip (software VIP with L2/BGP)
-  - External load balancers
-- Failover testing procedures
-- Verification commands
+- Three detailed load balancing cases:
+  - Case 1: Client-side NGINX proxy (default)
+  - Case 2: External HAProxy + client-side NGINX (recommended)
+  - Case 3: External LB as single endpoint
+- Certificate SAN updates for external LB
+- Failure simulation procedures for each case
+- Choosing the right configuration
 
 ---
 
@@ -96,13 +117,29 @@ Invoke a skill directly by name:
 
 **Covers:**
 - Version skew policy (one minor version at a time)
-- Pre-upgrade checklist
-- Upgrade commands and verification
-- Adding worker and control plane nodes
-- Removing nodes (drain → remove → cleanup)
+- Node management: adding workers (scale.yml), removing nodes, force-removing unhealthy nodes, replacing control plane nodes
+- Upgrade strategies: unsafe (cluster.yml) vs graceful (upgrade-cluster.yml)
+- Patch, minor, and major upgrade walkthroughs (v1.32 → v1.34)
+- Kubespray version bump procedures (git checkout, Python deps)
+- etcd and containerd version upgrades
 - etcd backup scripts and automation
-- Single-node and multi-node restore procedures
+- PodDisruptionBudget considerations
 - Cluster reset
+
+---
+
+### kubespray-monitoring
+
+**Use when:** Setting up Prometheus, Grafana, and Alertmanager on Kubespray clusters, configuring etcd metrics, or deploying NFS storage provisioners.
+
+**Covers:**
+- NFS subdir external provisioner for persistent storage
+- kube-prometheus-stack Helm chart with custom values
+- Grafana dashboard import via ConfigMap sidecar
+- Enabling etcd metrics (etcd_listen_metrics_urls)
+- Sample PromQL queries for etcd health
+- HAProxy and etcd scrape configuration
+- Complete monitoring target verification
 
 ---
 
@@ -289,23 +326,26 @@ kubectl get pods -A
 
 ## Common Workflows
 
-### Workflow: First Deployment
+### Workflow: Lab Environment Setup
 
 ```
-1. kubespray-deployment    → Set up inventory and variables
-2. Run cluster.yml         → Deploy cluster
-3. kubespray-troubleshooting → If deployment fails
-4. Verify with kubectl     → Confirm success
+1. kubespray-lab-setup     → Provision Vagrant/VirtualBox VMs
+2. kubespray-deployment    → Set up inventory and variables
+3. Run cluster.yml         → Deploy cluster
+4. kubespray-troubleshooting → If deployment fails
+5. Verify with kubectl     → Confirm success
 ```
 
 ### Workflow: Production HA Setup
 
 ```
-1. kubespray-ha-configuration → Plan HA architecture
-2. kubespray-deployment       → Configure inventory for HA
-3. Run cluster.yml            → Deploy
-4. kubespray-certificates     → Enable auto-renewal
-5. kubespray-operations       → Set up etcd backups
+1. kubespray-lab-setup           → Provision lab (or prepare production nodes)
+2. kubespray-ha-configuration    → Plan HA architecture and LB strategy
+3. kubespray-deployment          → Configure inventory for HA
+4. Run cluster.yml               → Deploy
+5. kubespray-certificates        → Enable auto-renewal
+6. kubespray-monitoring          → Deploy Prometheus/Grafana stack
+7. kubespray-operations          → Set up etcd backups
 ```
 
 ### Workflow: Cluster Upgrade
@@ -326,6 +366,16 @@ kubectl get pods -A
 3. Stage images          → Private registry
 4. kubespray-airgap      → Configure offline.yml
 5. kubespray-deployment  → Deploy cluster
+```
+
+### Workflow: Production Monitoring
+
+```
+1. kubespray-monitoring    → Deploy NFS provisioner for storage
+2. kubespray-monitoring    → Install kube-prometheus-stack
+3. kubespray-monitoring    → Enable etcd metrics collection
+4. kubespray-monitoring    → Import Grafana dashboards
+5. Verify Prometheus targets → All targets UP
 ```
 
 ### Workflow: Troubleshooting
@@ -395,14 +445,18 @@ Or face cluster outage when certificates expire.
 ```
 kubespray-skills/
 ├── README.md                           # This file
+├── kubespray-lab-setup/
+│   └── SKILL.md                        # Vagrant/VirtualBox lab setup
 ├── kubespray-deployment/
 │   └── SKILL.md                        # Deployment guide
 ├── kubespray-troubleshooting/
 │   └── SKILL.md                        # Troubleshooting guide
 ├── kubespray-ha-configuration/
-│   └── SKILL.md                        # HA setup guide
+│   └── SKILL.md                        # HA setup & load balancing guide
 ├── kubespray-operations/
-│   └── SKILL.md                        # Operations guide
+│   └── SKILL.md                        # Node management & upgrades guide
+├── kubespray-monitoring/
+│   └── SKILL.md                        # Prometheus/Grafana monitoring guide
 ├── kubespray-airgap/
 │   └── SKILL.md                        # Air-gap deployment guide
 └── kubespray-certificates/
@@ -438,3 +492,4 @@ To improve these skills:
 |---------|------|---------|
 | 1.0.0 | 2024-01 | Initial release with 6 skills |
 | 1.1.0 | 2024-01 | Added searchable errors, fixed flowcharts, enhanced documentation |
+| 2.0.0 | 2026-02 | Added kubespray-lab-setup and kubespray-monitoring skills. Major updates to kubespray-ha-configuration (3 detailed LB cases with HAProxy), kubespray-operations (node management, patch/minor/major upgrade walkthroughs), and kubespray-deployment (variable precedence, deployment phases, expanded validation). Now 8 skills total. |
