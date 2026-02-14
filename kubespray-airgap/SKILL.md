@@ -1,302 +1,313 @@
 ---
 name: kubespray-airgap
-description: Use when deploying Kubernetes in air-gapped or offline environments, setting up private container registries, staging binaries for offline use, or configuring containerd registry mirrors.
+description: Use when deploying Kubernetes in air-gapped or offline environments using kubespray-offline tool, setting up private container registries, staging binaries and images for offline use, configuring containerd registry mirrors, or troubleshooting image pull failures in isolated networks.
 ---
 
-# Kubespray Air-Gap Deployment
+# Kubespray Air-Gap Deployment with kubespray-offline
 
 ## Overview
 
-Air-gapped environments (banks, government, defense) have no internet access. Kubespray requires all binaries and container images to be staged internally before deployment.
+Air-gapped environments have no internet access. The kubespray-offline tool automates staging all binaries and container images required for a fully offline Kubernetes deployment.
 
-**Core principle:** Stage everything (binaries + images) inside the network before running Kubespray. Configure mirrors so containerd fetches from internal sources.
+**Core principle:** kubespray-offline downloads everything on an internet-connected machine, produces a self-contained `outputs/` directory, then deploys entirely offline on the target network. No internet is needed after the transfer.
 
 ## When to Use
 
-- Deploying to networks with no internet access
-- Setting up private container registries
-- Staging Kubernetes binaries internally
-- Configuring containerd to use internal mirrors
+- Deploying Kubernetes to networks with no internet access
+- Using the kubespray-offline tool for offline deployment
+- Setting up private container registries for Kubernetes
+- Configuring containerd to use internal registry mirrors
+- Troubleshooting image pull issues in air-gapped environments
 
-**Not for:** Online deployments (use kubespray-deployment), troubleshooting (use kubespray-troubleshooting)
+**Not for:** Online deployments (use kubespray-deployment), general troubleshooting (use kubespray-troubleshooting).
 
-## What You Need Inside the Air-Gap
+## kubespray-offline Tool Workflow
 
-1. **Private container registry** - Harbor, Nexus, or any OCI-compliant registry
-2. **HTTP file server** - Hosts binaries (containerd, runc, etcd, kubeadm, etc.)
-3. **Ansible control node** - Inside the isolated network
+### download-all.sh Pipeline
 
-## Identifying Required Files
+The `download-all.sh` script runs these steps in order on an internet-connected machine:
 
-### Generate Download List
+```
+config.sh --> precheck.sh --> prepare-pkgs.sh --> prepare-py.sh --> get-kubespray.sh -->
+pypi-mirror.sh --> download-kubespray-files.sh --> download-additional-containers.sh -->
+create-repo.sh --> copy-target-scripts.sh
+```
+
+### Configuration Variables (config.sh)
+
+Set versions in `config.sh` (and `target-scripts/config.sh`):
 
 ```bash
-# On internet-connected machine
-ansible-playbook -i inventory/mycluster/inventory.ini cluster.yml \
-  --tags download \
-  -e download_run_once=true \
-  -e download_localhost=true
+KUBESPRAY_VERSION=2.30.0
+RUNC_VERSION=1.3.4
+CONTAINERD_VERSION=2.2.1
+NERDCTL_VERSION=2.2.1
+CNI_VERSION=1.8.0
+NGINX_VERSION=1.29.4
+REGISTRY_VERSION=3.0.0
+REGISTRY_PORT=35000
 ```
 
-Files download to `/tmp/releases/` (or `local_release_dir`).
+## Outputs Directory Structure
 
-### Required Binaries
-
-```
-/var/www/files/
-├── kubernetes/v1.32.0/{kubeadm,kubectl,kubelet}
-├── containerd/v2.0.0/containerd-2.0.0-linux-amd64.tar.gz
-├── runc/v1.2.0/runc.amd64
-├── cni-plugins/v1.6.0/cni-plugins-linux-amd64-v1.6.0.tgz
-├── etcd/v3.5.15/etcd-v3.5.15-linux-amd64.tar.gz
-├── crictl/v1.31.0/crictl-v1.31.0-linux-amd64.tar.gz
-└── nerdctl/v2.0.0/nerdctl-2.0.0-linux-amd64.tar.gz
-```
-
-### Required Container Images
-
-**Note:** Version numbers are examples. Check `roles/download/defaults/main/main.yml` for current versions.
+After `download-all.sh` completes, the `outputs/` directory contains everything needed:
 
 ```
-registry.k8s.io/pause:3.x
-registry.k8s.io/coredns/coredns:v1.x.x
-registry.k8s.io/kube-proxy:v1.x.x
-registry.k8s.io/metrics-server/metrics-server:v0.x.x
-quay.io/coreos/flannel:v0.x.x   # if using Flannel
-docker.io/calico/...:v3.x.x     # if using Calico
+outputs/
+├── config.sh                # Version configs
+├── files/                   # Binaries (kubectl, kubelet, kubeadm, containerd, runc, etcd, cni, helm, etc.)
+├── images/                  # Container images as .tar.gz + images.list + additional-images.list
+├── pypi/                    # Python packages + index
+├── rpms/                    # RPM packages + repo metadata
+├── playbook/                # offline-repo ansible role
+├── setup-all.sh             # Master setup script
+├── setup-container.sh       # Install containerd + load nginx/registry images
+├── install-containerd.sh    # Containerd installation from local files
+├── start-nginx.sh           # Start nginx container (file server)
+├── start-registry.sh        # Start registry container (port 35000)
+├── setup-offline.sh         # Configure offline yum repo + pypi mirror
+├── setup-py.sh              # Install python from offline repo
+├── load-push-all-images.sh  # Load images to containerd + push to registry
+├── extract-kubespray.sh     # Extract kubespray tarball + apply patches
+└── nginx-default.conf       # Nginx config
 ```
 
-### Generate Complete Image List
+Transfer this entire `outputs/` directory to the admin server inside the air-gapped network.
+
+## Deployment Pipeline (Step by Step)
+
+Run these steps on the admin server inside the air-gapped network:
 
 ```bash
-# List all images Kubespray will use for your configuration
-cd kubespray
+# [1] Install containerd, load nginx/registry images
+cd outputs && ./setup-container.sh
 
-# Method 1: Parse download defaults
-grep -r "image:" roles/download/defaults/ | grep -oP '(?<=: ).*' | sort -u
+# [2] Start nginx (serves files, rpms, pypi on port 80)
+./start-nginx.sh
 
-# Method 2: Use contrib script (if available)
-./contrib/offline/generate_list.sh
+# [3] Configure offline repos (yum + pypi mirror)
+./setup-offline.sh
 
-# Method 3: Dry-run and capture image references
-ansible-playbook -i inventory/mycluster/inventory.ini cluster.yml \
-  --tags download -e download_run_once=true --check -v 2>&1 | \
-  grep -oP '[\w./]+:[\w.-]+' | sort -u
+# [4] Install python from offline repo
+./setup-py.sh
+
+# [5] Start private registry (port 35000)
+./start-registry.sh
+
+# [6] Load all images and push to registry
+./load-push-all-images.sh
+
+# [7] Extract kubespray
+./extract-kubespray.sh
 ```
 
-## Staging Binaries
+**ARM64 note:** Use `--all-platforms` flag when loading images:
 
-### Configure Kubespray for Internal File Server
+```bash
+./load-push-all-images.sh --all-platforms
+```
 
-Create `inventory/mycluster/group_vars/all/offline.yml`:
+## offline.yml Configuration
+
+Create `inventory/mycluster/group_vars/all/offline.yml` with all download URLs pointing to the admin server. Replace `ADMIN_IP` with the actual IP of the admin server.
 
 ```yaml
-# Internal file server
-files_repo: "http://files.internal.example.com"
+http_server: "http://ADMIN_IP"
+registry_host: "ADMIN_IP:35000"
 
-# Kubernetes binaries
-kubeadm_download_url: "{{ files_repo }}/kubernetes/{{ kube_version }}/kubeadm"
-kubectl_download_url: "{{ files_repo }}/kubernetes/{{ kube_version }}/kubectl"
-kubelet_download_url: "{{ files_repo }}/kubernetes/{{ kube_version }}/kubelet"
+containerd_registries_mirrors:
+  - prefix: "{{ registry_host }}"
+    mirrors:
+      - host: "http://{{ registry_host }}"
+        capabilities: ["pull", "resolve"]
+        skip_verify: true
 
-# Container runtime
-containerd_download_url: "{{ files_repo }}/containerd/v{{ containerd_version }}/containerd-{{ containerd_version }}-linux-{{ image_arch }}.tar.gz"
+files_repo: "{{ http_server }}/files"
+yum_repo: "{{ http_server }}/rpms"
+
+# All image repos point to private registry
+kube_image_repo: "{{ registry_host }}"
+gcr_image_repo: "{{ registry_host }}"
+docker_image_repo: "{{ registry_host }}"
+quay_image_repo: "{{ registry_host }}"
+github_image_repo: "{{ registry_host }}"
+
+# Binary download URLs
+kubeadm_download_url: "{{ files_repo }}/kubernetes/v{{ kube_version }}/kubeadm"
+kubectl_download_url: "{{ files_repo }}/kubernetes/v{{ kube_version }}/kubectl"
+kubelet_download_url: "{{ files_repo }}/kubernetes/v{{ kube_version }}/kubelet"
+etcd_download_url: "{{ files_repo }}/kubernetes/etcd/etcd-v{{ etcd_version }}-linux-{{ image_arch }}.tar.gz"
+cni_download_url: "{{ files_repo }}/kubernetes/cni/cni-plugins-linux-{{ image_arch }}-v{{ cni_version }}.tgz"
+crictl_download_url: "{{ files_repo }}/kubernetes/cri-tools/crictl-v{{ crictl_version }}-{{ ansible_system | lower }}-{{ image_arch }}.tar.gz"
 runc_download_url: "{{ files_repo }}/runc/v{{ runc_version }}/runc.{{ image_arch }}"
-crictl_download_url: "{{ files_repo }}/crictl/v{{ crictl_version }}/crictl-v{{ crictl_version }}-linux-{{ image_arch }}.tar.gz"
-nerdctl_download_url: "{{ files_repo }}/nerdctl/v{{ nerdctl_version }}/nerdctl-{{ nerdctl_version }}-linux-{{ image_arch }}.tar.gz"
-
-# CNI and etcd
-cni_download_url: "{{ files_repo }}/cni-plugins/v{{ cni_version }}/cni-plugins-linux-{{ image_arch }}-v{{ cni_version }}.tgz"
-etcd_download_url: "{{ files_repo }}/etcd/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-{{ image_arch }}.tar.gz"
+nerdctl_download_url: "{{ files_repo }}/nerdctl-{{ nerdctl_version }}-{{ ansible_system | lower }}-{{ image_arch }}.tar.gz"
+containerd_download_url: "{{ files_repo }}/containerd-{{ containerd_version }}-linux-{{ image_arch }}.tar.gz"
+helm_download_url: "{{ files_repo }}/helm-v{{ helm_version }}-linux-{{ image_arch }}.tar.gz"
+calicoctl_download_url: "{{ files_repo }}/kubernetes/calico/v{{ calico_ctl_version }}/calicoctl-linux-{{ image_arch }}"
+calico_crds_download_url: "{{ files_repo }}/kubernetes/calico/v{{ calico_version }}.tar.gz"
+ciliumcli_download_url: "{{ files_repo }}/cilium-cli/v{{ cilium_cli_version }}/cilium-linux-{{ image_arch }}.tar.gz"
 ```
 
-## Populating Private Registry
+## Containerd Registry Mirrors for Image Pull
 
-### Pull, Tag, Push Script
-
-```bash
-#!/bin/bash
-PRIVATE_REGISTRY="registry.internal.example.com"
-
-IMAGES=(
-  "registry.k8s.io/pause:3.10"
-  "registry.k8s.io/coredns/coredns:v1.11.3"
-  "registry.k8s.io/kube-proxy:v1.32.0"
-  "quay.io/coreos/flannel:v0.26.1"
-)
-
-for IMAGE in "${IMAGES[@]}"; do
-  # Extract image name without registry
-  NAME=$(echo $IMAGE | sed 's|.*/||')
-
-  docker pull $IMAGE
-  docker tag $IMAGE ${PRIVATE_REGISTRY}/${NAME}
-  docker push ${PRIVATE_REGISTRY}/${NAME}
-done
-```
-
-Run on internet-connected machine, then transfer registry data to air-gap.
-
-## Configuring containerd Mirrors
-
-Create `inventory/mycluster/group_vars/all/containerd.yml`:
+Configure mirrors so pods referencing docker.io, quay.io, etc. are redirected to the private registry:
 
 ```yaml
 containerd_registries_mirrors:
-  - prefix: registry.k8s.io
+  - prefix: "{{ registry_host }}"
     mirrors:
-      - host: https://registry.internal.example.com
+      - host: "http://{{ registry_host }}"
+        capabilities: ["pull", "resolve"]
+        skip_verify: true
+  - prefix: "docker.io"
+    mirrors:
+      - host: "http://ADMIN_IP:35000"
         capabilities: ["pull", "resolve"]
         skip_verify: false
-        ca_file: /etc/pki/ca-trust/source/anchors/internal-ca.crt
-
-  - prefix: docker.io
+  - prefix: "registry-1.docker.io"
     mirrors:
-      - host: https://registry.internal.example.com
+      - host: "http://ADMIN_IP:35000"
         capabilities: ["pull", "resolve"]
         skip_verify: false
-        ca_file: /etc/pki/ca-trust/source/anchors/internal-ca.crt
-
-  - prefix: quay.io
+  - prefix: "quay.io"
     mirrors:
-      - host: https://registry.internal.example.com
+      - host: "http://ADMIN_IP:35000"
         capabilities: ["pull", "resolve"]
         skip_verify: false
-        ca_file: /etc/pki/ca-trust/source/anchors/internal-ca.crt
-
-  - prefix: ghcr.io
-    mirrors:
-      - host: https://registry.internal.example.com
-        capabilities: ["pull", "resolve"]
-        skip_verify: false
-        ca_file: /etc/pki/ca-trust/source/anchors/internal-ca.crt
 ```
 
-### Resulting Configuration on Nodes
+Apply mirror configuration without full redeploy:
+
+```bash
+ansible-playbook -i inventory/mycluster/inventory.ini -v cluster.yml --tags containerd
+```
+
+Resulting configuration on each node:
 
 ```
 /etc/containerd/certs.d/
-├── registry.k8s.io/hosts.toml
+├── 192.168.10.10:35000/hosts.toml
 ├── docker.io/hosts.toml
 ├── quay.io/hosts.toml
-└── ghcr.io/hosts.toml
+└── registry-1.docker.io/hosts.toml
 ```
 
-## Override Image Repositories
+## Cluster Deployment
+
+```bash
+cd kubespray-2.30.0
+
+# Install dependencies from offline pypi mirror
+pip install -U pip && pip install -r requirements.txt
+
+# Place offline.yml
+cp offline.yml inventory/mycluster/group_vars/all/
+
+# Configure inventory.ini and group_vars as needed
+
+# Run offline-repo playbook (configures yum/apt repos on all nodes)
+ansible-playbook -i inventory/mycluster/inventory.ini offline-repo/playbook/offline-repo.yml
+
+# Deploy the cluster
+ansible-playbook -i inventory/mycluster/inventory.ini -v cluster.yml
+```
+
+## Pushing Additional Images Post-Deploy
+
+To add images after the cluster is running (e.g., application images):
+
+```bash
+# On admin server with podman
+podman pull nginx:alpine
+podman tag nginx:alpine ADMIN_IP:35000/library/nginx:alpine
+
+# Configure insecure registry in /etc/containers/registries.conf if needed
+podman push ADMIN_IP:35000/library/nginx:alpine
+```
+
+## Changing kube_version
+
+To deploy a different Kubernetes version than the default:
+
+```bash
+# Modify generate_list.sh to target a specific version
+sed -i 's|offline/generate_list.sh|offline/generate_list.sh -e kube_version=1.33.7|g' download-kubespray-files.sh
+
+# Re-run to download version-specific binaries and images
+./download-kubespray-files.sh
+```
+
+## Troubleshooting
+
+### etcd download 404 on ARM64
+
+```
+etcd-v3.5.26-linux-amd64.tar.gz 404 Not Found
+```
+
+**Cause:** `amd64` is hardcoded instead of using architecture variable.
+
+**Fix:** In `offline.yml`, ensure etcd URL uses `{{ image_arch }}`:
 
 ```yaml
-# inventory/mycluster/group_vars/k8s_cluster/k8s-cluster.yml
-kube_image_repo: "registry.internal.example.com"
-gcr_image_repo: "registry.internal.example.com"
-docker_image_repo: "registry.internal.example.com"
-quay_image_repo: "registry.internal.example.com"
-
-# Critical: sandbox (pause) image
-pod_infra_image_repo: "registry.internal.example.com"
-pod_infra_image_tag: "3.10"
+etcd_download_url: "{{ files_repo }}/kubernetes/etcd/etcd-v{{ etcd_version }}-linux-{{ image_arch }}.tar.gz"
 ```
 
-## Package Manager Dependencies
+### ImagePullBackOff for docker.io Images
 
-Kubespray installs packages (conntrack, socat, etc.). Options:
+```
+Failed to pull image "docker.io/library/nginx:1.25": rpc error: ...
+```
 
-1. **Internal repo mirror** (recommended)
-   - Use reposync (RHEL) or apt-mirror (Debian)
-   - Point nodes at internal mirror
-
-2. **Pre-install packages**
-   - Build golden image with all dependencies
-   - Use for all Kubernetes nodes
-
-3. **Skip package management** (risky)
-   - Ensure all dependencies pre-installed
-
-## Running Offline Deployment
+**Fix:** Either push the image to the private registry, or configure `containerd_registries_mirrors` to redirect docker.io to the private registry. Then apply:
 
 ```bash
-ansible-playbook -i inventory/mycluster/inventory.ini cluster.yml \
-  -e download_run_once=false \
-  -e download_localhost=false \
-  -b
+ansible-playbook -i inventory/mycluster/inventory.ini -v cluster.yml --tags containerd
 ```
 
-Or if binaries are pre-staged on nodes:
-```bash
-ansible-playbook -i inventory/mycluster/inventory.ini cluster.yml \
-  -e skip_downloads=true \
-  -b
+### "image might be filtered out" During load-push
+
+```
+FATA[0000] image might be filtered out
 ```
 
-## Verification
+**Cause:** Platform mismatch when loading multi-arch images.
 
-After deployment, verify no external connections:
+**Fix:** Add `--all-platforms` to the nerdctl load command:
 
 ```bash
-# Check containerd logs for external registry access
-journalctl -u containerd | grep -i "registry.k8s.io\|docker.io\|quay.io"
-
-# Should see only internal registry
-journalctl -u containerd | grep "registry.internal"
+./load-push-all-images.sh --all-platforms
 ```
 
-## Common Errors (Searchable)
+### loadFlannelSubnetEnv Failed
 
 ```
-Error response from daemon: Get "https://registry.internal.example.com/v2/": x509: certificate signed by unknown authority
+failed to load subnet env: open /run/flannel/subnet.env: no such file or directory
 ```
-**Fix:** Distribute CA cert to nodes, set `ca_file` in containerd config, run `update-ca-trust`
 
-```
-failed to pull image "registry.k8s.io/pause:3.10": failed to resolve reference
-```
-**Fix:** Image missing from private registry. Pull, tag, push the image.
+**Fix:** Flannel requires `/run/flannel/subnet.env`. Check that the CNI plugin is correctly installed and flannel DaemonSet is running.
 
-```
-TASK [download : download_container | Download image] failed
-curl: (7) Failed to connect to files.internal.example.com port 80: Connection refused
-```
-**Fix:** Internal file server not reachable. Check DNS, firewall, service status.
+### Nodes Cannot Resolve Hostnames
 
+**Fix:** Configure DNS within the air-gapped network, or add entries to `/etc/hosts` on all nodes for the admin server and other cluster nodes.
+
+### Apply Mirror Config Changes Only
+
+Use the `--tags containerd` flag to apply containerd mirror configuration changes without running the full cluster deployment:
+
+```bash
+ansible-playbook -i inventory/mycluster/inventory.ini -v cluster.yml --tags containerd
 ```
-sha256 checksum mismatch
-```
-**Fix:** Binary corrupted during transfer. Re-download and verify checksum.
 
 ## Common Pitfalls
 
 | Pitfall | Solution |
 |---------|----------|
-| Missing one image | Deployment proceeds, DaemonSet fails later. Verify all images staged. |
-| Self-signed cert errors | Distribute CA cert to nodes, configure `ca_file` |
-| DNS resolution failure | Use IP addresses or configure internal DNS |
-| Binary architecture mismatch | Verify amd64 vs arm64 matches target nodes |
-| Version mismatch | Keep staged files synced with Kubespray version variables |
-
-## Complete offline.yml Example
-
-```yaml
-# inventory/mycluster/group_vars/all/offline.yml
-
-files_repo: "http://files.internal.example.com"
-
-# Kubernetes
-kubeadm_download_url: "{{ files_repo }}/kubernetes/{{ kube_version }}/kubeadm"
-kubectl_download_url: "{{ files_repo }}/kubernetes/{{ kube_version }}/kubectl"
-kubelet_download_url: "{{ files_repo }}/kubernetes/{{ kube_version }}/kubelet"
-
-# Container runtime
-containerd_download_url: "{{ files_repo }}/containerd/v{{ containerd_version }}/containerd-{{ containerd_version }}-linux-{{ image_arch }}.tar.gz"
-runc_download_url: "{{ files_repo }}/runc/v{{ runc_version }}/runc.{{ image_arch }}"
-nerdctl_download_url: "{{ files_repo }}/nerdctl/v{{ nerdctl_version }}/nerdctl-{{ nerdctl_version }}-linux-{{ image_arch }}.tar.gz"
-crictl_download_url: "{{ files_repo }}/crictl/v{{ crictl_version }}/crictl-v{{ crictl_version }}-linux-{{ image_arch }}.tar.gz"
-
-# CNI and etcd
-cni_download_url: "{{ files_repo }}/cni-plugins/v{{ cni_version }}/cni-plugins-linux-{{ image_arch }}-v{{ cni_version }}.tgz"
-etcd_download_url: "{{ files_repo }}/etcd/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-{{ image_arch }}.tar.gz"
-
-# Image registries (all point to internal)
-kube_image_repo: "registry.internal.example.com"
-gcr_image_repo: "registry.internal.example.com"
-docker_image_repo: "registry.internal.example.com"
-quay_image_repo: "registry.internal.example.com"
-```
+| Missing images discovered late | DaemonSets/Deployments fail after deploy. Verify all images in `images.list` are pushed to registry before cluster deployment. |
+| Architecture mismatch (amd64 vs arm64) | Use `{{ image_arch }}` in all download URLs. Use `--all-platforms` with nerdctl load on ARM64. |
+| Registry not reachable from nodes | Ensure firewall allows port 35000 from all nodes to admin server. Test with `curl http://ADMIN_IP:35000/v2/`. |
+| Forgot to run offline-repo playbook | Nodes cannot install OS packages. Run `offline-repo.yml` before `cluster.yml`. |
+| Version mismatch between config.sh and kubespray | Keep `config.sh` versions aligned with the kubespray version specified in `KUBESPRAY_VERSION`. |
+| DNS not configured in air-gap | Nodes fail to resolve admin server hostname. Use IP addresses or configure `/etc/hosts`. |
+| Self-signed cert errors with registry | Use `skip_verify: true` in containerd mirrors, or distribute CA certs to all nodes. |
+| Nginx file server not started | Binary downloads fail with connection refused. Run `./start-nginx.sh` before deployment. |
