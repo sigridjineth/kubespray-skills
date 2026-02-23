@@ -197,8 +197,7 @@ discovery:
       - "sha256:bd763182..."
 nodeRegistration:
   kubeletExtraArgs:
-    - name: node-ip
-      value: "192.168.10.101"
+    node-ip: "192.168.10.101"
   criSocket: "unix:///run/containerd/containerd.sock"
 ```
 
@@ -237,9 +236,9 @@ kubeadm token list
 
 ### 3. Verify Network
 ```bash
-# From worker
+# From worker — verify control plane API is reachable
 ping 192.168.10.100
-ss -tlnp | grep 6443  # Should show kubelet after join
+curl -k https://192.168.10.100:6443/healthz  # Should return "ok"
 ```
 
 ### 4. Check Firewall

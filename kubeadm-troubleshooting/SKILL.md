@@ -288,7 +288,7 @@ kubeadm init phase certs apiserver --apiserver-cert-extra-sans=new.domain.com
 kubeadm certs renew all
 
 # Restart control plane components
-crictl pods --name='kube-apiserver|kube-controller|kube-scheduler|etcd' -q | xargs -I {} crictl stopp {}
+crictl pods --name='kube-apiserver|kube-controller|kube-scheduler|etcd' -q | xargs -I {} crictl stop {}
 ```
 
 ### Clock Skew

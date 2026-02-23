@@ -70,8 +70,7 @@ bootstrapTokens:
   ttl: "24h"
 nodeRegistration:
   kubeletExtraArgs:
-    - name: node-ip
-      value: "192.168.10.100"
+    node-ip: "192.168.10.100"
   criSocket: "unix:///run/containerd/containerd.sock"
 localAPIEndpoint:
   advertiseAddress: "192.168.10.100"
